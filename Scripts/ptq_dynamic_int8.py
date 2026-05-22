@@ -2,7 +2,7 @@
 ptq_dynamic_int8.py
 
 Lädt die fine-getunten LiLT Teacher-Modelle, wendet dynamische INT8-Quantisierung an
-und benchmarkt sie mit dem SlimDoc eval-Framework (evaluate_model).
+und benchmarkt sie mit derselben Evaluierungslogik wie das SlimDoc-Framework.
 
 Unterstützte Datasets: FUNSD, SROIE, DocVQA, InfographicsVQA, WikiTableQuestions
 
@@ -17,19 +17,23 @@ Aufruf:
 
 import argparse
 import os
-import shutil
 import sys
 import tempfile
+import numpy as np
 import torch
 import wandb
+from sklearn.metrics import f1_score
 
 # ── Pfad zu slimdoc-main hinzufügen ─────────────────────────────────────────
 SLIMDOC_PATH = "/data/stud/2026-richtstein-ba/slimdoc-main"
 sys.path.insert(0, SLIMDOC_PATH)
 
-from slimdoc import DATASET_CONF, ENV, TASKS, DUModel
-from slimdoc.model import get_model
-from slimdoc.eval.eval import evaluate_model
+from slimdoc import DATASET_CONF, DEFAULTS, ENV, TASKS, DUModel
+from slimdoc.data.hf_dataset import load_dataset
+from slimdoc.data.utils import create_dataloader
+from slimdoc.eval.due_eval import evaluate_due_results
+from slimdoc.model import get_model, forward
+from slimdoc.train.utils import extract_text_logits
 
 
 # ── Mapping: Dataset → Teacher-Run-Name ──────────────────────────────────────
@@ -53,6 +57,124 @@ def get_model_size_mb(model: torch.nn.Module) -> float:
     return size_mb
 
 
+# ── Evaluierungsloop (identische Logik wie SlimDoc eval.py) ──────────────────
+def evaluate_int8_model(model, dataset_name, task, model_type):
+    """
+    Evaluiert ein INT8-Modell mit exakt derselben Logik wie evaluate_model()
+    im SlimDoc-Framework. Einziger Unterschied: das Modell wird direkt
+    übergeben statt aus einem Checkpoint geladen zu werden.
+
+    Metriken:
+      - SER-Datasets (FUNSD, SROIE):         weighted F1-Score
+      - VQA-Datasets (DocVQA, InfographicsVQA, WikiTableQuestions): ANLS
+    """
+    device = torch.device("cpu")  # INT8-Inferenz läuft auf CPU
+    model = model.to(device)
+    model.eval()
+
+    # Dataset laden (identisch zu eval.py)
+    dataset = load_dataset([dataset_name], use_cache=True, use_chatgpt_labels=False)
+    test_dataloader = create_dataloader(
+        dataset["test"],
+        num_workers=0,
+        batch_size=16,
+        shuffle=False,
+    )
+
+    sample_ids_preds = []
+
+    with torch.no_grad():
+        for inputs in test_dataloader:
+            inputs = {
+                k: v.to(device) if isinstance(v, torch.Tensor) else v
+                for k, v in inputs.items()
+            }
+
+            text_seq_length = inputs["input_ids"].shape[1]
+
+            # Forward pass (identisch zu eval.py)
+            outputs = forward(
+                model=model,
+                model_type=model_type,
+                output_internals=False,
+                input_ids=inputs["input_ids"],
+                bbox=inputs["bbox"],
+                attention_mask=inputs["attention_mask"],
+                pixel_values=None,
+            )
+
+            labels = inputs["labels"]
+
+            # Predictions extrahieren (identisch zu eval.py)
+            if task == TASKS.SER:
+                logits = extract_text_logits(
+                    model_type=model_type,
+                    logits=outputs["logits"],
+                    text_seq_length=text_seq_length,
+                    task=task,
+                )
+                predictions = torch.argmax(logits, dim=-1)
+
+            elif task == TASKS.VQA:
+                from transformers import AutoTokenizer
+                tokenizer = AutoTokenizer.from_pretrained("SCUT-DLVCLab/lilt-roberta-en-base")
+                start_logits = extract_text_logits(
+                    model_type=model_type,
+                    logits=outputs["start_logits"],
+                    text_seq_length=text_seq_length,
+                    task=task,
+                )
+                end_logits = extract_text_logits(
+                    model_type=model_type,
+                    logits=outputs["end_logits"],
+                    text_seq_length=text_seq_length,
+                    task=task,
+                )
+                predicted_start = torch.argmax(start_logits, dim=1)
+                predicted_end = torch.argmax(end_logits, dim=1)
+                selected_ranges = [
+                    inputs["input_ids"][i, start:end]
+                    for i, (start, end) in enumerate(
+                        zip(predicted_start, predicted_end)
+                    )
+                ]
+                predictions = tokenizer.batch_decode(selected_ranges)
+
+            sample_ids_preds.append(
+                (inputs["sample_id"], inputs["dataset_name"], predictions, labels)
+            )
+
+    # Score berechnen (identisch zu eval.py __eval_final)
+    if task == TASKS.SER:
+        ser_scores = []
+        for sample_ids, dataset_names, predictions, labels in sample_ids_preds:
+            for sample_id, ds_name, prediction, label in zip(
+                sample_ids, dataset_names, predictions, labels
+            ):
+                pred_flat = prediction.view(-1).cpu().numpy()
+                label_flat = label.view(-1).cpu().numpy()
+                mask = label_flat != -100
+                f1 = f1_score(label_flat[mask], pred_flat[mask], average="weighted")
+                ser_scores.append(f1)
+        score = float(np.mean(ser_scores))
+
+    elif task == TASKS.VQA:
+        due_predictions = {}
+        for sample_ids, dataset_names, predictions, labels in sample_ids_preds:
+            for sample_id, ds_name, prediction, label in zip(
+                sample_ids, dataset_names, predictions, labels
+            ):
+                due_predictions[sample_id] = prediction
+        score = evaluate_due_results(
+            dataset_name=dataset_name,
+            split="test",
+            predictions=due_predictions,
+            only_our_samples=True,
+        )
+
+    return score
+
+
 # ── Hauptfunktion ─────────────────────────────────────────────────────────────
 def quantize_and_evaluate(dataset_name: str):
     print("\n" + "=" * 60)
@@ -63,7 +185,7 @@ def quantize_and_evaluate(dataset_name: str):
     ds_conf = DATASET_CONF[dataset_name]
     task = ds_conf.task
     num_labels = ds_conf.num_labels
-    device = torch.device("cpu")  # quantize_dynamic läuft nur auf CPU
+    device = torch.device("cpu")
 
     # ── Schritt 1: Teacher-Checkpoint laden ───────────────────────────────────
     print(f"\n[1/4] Lade Teacher-Checkpoint: {run_name}")
@@ -77,7 +199,6 @@ def quantize_and_evaluate(dataset_name: str):
     baseline_accuracy = checkpoint["best_accuracy"]
     print(f"  Baseline Accuracy (FP32): {baseline_accuracy:.4f}")
 
-    # Modell mit korrekter Architektur laden
     model_fp32 = get_model(
         model_type=DUModel.LiLT_TextFlow,
         task=task,
@@ -108,49 +229,21 @@ def quantize_and_evaluate(dataset_name: str):
     print(f"  INT8 Modellgröße: {int8_size:.1f} MB")
     print(f"  Größenreduktion:  {size_reduction:.1f}%")
 
-    # ── Schritt 3: Quantisiertes Modell dauerhaft speichern ───────────────────
+    # ── Schritt 3: Quantisiertes Modell speichern ─────────────────────────────
     print(f"\n[3/4] Speichere quantisiertes Modell...")
     save_dir = f"models/quantized/{run_name}_int8"
     os.makedirs(save_dir, exist_ok=True)
     torch.save(model_int8.state_dict(), f"{save_dir}/model_int8.pt")
     print(f"  Gespeichert unter: {save_dir}/")
 
-    # ── Schritt 4: Benchmark mit evaluate_model() ─────────────────────────────
-    # evaluate_model() parst den run_name strikt – "_int8" würde den Parser
-    # zum Absturz bringen. Lösung: originalen Checkpoint temporär mit dem
-    # INT8-Modell überschreiben, dann mit originalem run_name evaluieren,
-    # danach Original wiederherstellen.
+    # ── Schritt 4: Benchmark ──────────────────────────────────────────────────
     print(f"\n[4/4] Starte Benchmark auf {dataset_name}...")
-
-    backup_path = ENV.MODELS_DIR / run_name / "best_fp32_backup.pth"
-    try:
-        # Backup des originalen FP32-Checkpoints
-        shutil.copy(chk_path, backup_path)
-
-        # INT8-Checkpoint im SlimDoc-Format an den originalen Pfad schreiben
-        torch.save({
-            "epoch":               checkpoint["epoch"],
-            "model_state_dict":    model_int8.state_dict(),
-            "optimizer_state_dict": None,
-            "best_accuracy":       baseline_accuracy,
-            "is_student":          False,
-            "student_layer_map":   None,
-            "vocab_name":          None,
-        }, chk_path)
-
-        # Benchmark mit originalem run_name (Parser-kompatibel)
-        int8_score = evaluate_model(
-            run_name=run_name,
-            split="test",
-            batch_size=16,
-        )
-
-    finally:
-        # Original immer wiederherstellen – auch bei Fehler
-        if backup_path.exists():
-            shutil.copy(backup_path, chk_path)
-            os.remove(backup_path)
-            print(f"  FP32-Checkpoint wiederhergestellt.")
+    int8_score = evaluate_int8_model(
+        model=model_int8,
+        dataset_name=dataset_name,
+        task=task,
+        model_type=DUModel.LiLT_TextFlow,
+    )
 
     print(f"\n  Ergebnisse für {dataset_name}:")
     print(f"  FP32 Score (Baseline): {baseline_accuracy:.4f}")
@@ -209,7 +302,6 @@ if __name__ == "__main__":
 
     datasets_to_run = SUPPORTED_DATASETS if args.all else [args.dataset]
 
-    # W&B initialisieren
     wandb.init(
         project="lilt-quantization-benchmark",
         name=f"ptq-dynamic-int8-{'all' if args.all else args.dataset}",
@@ -227,7 +319,6 @@ if __name__ == "__main__":
         if result:
             all_results.append(result)
 
-    # ── Gesamtzusammenfassung ─────────────────────────────────────────────────
     if len(all_results) > 1:
         print("\n" + "=" * 60)
         print("  GESAMTZUSAMMENFASSUNG")
