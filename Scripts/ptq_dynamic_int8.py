@@ -75,6 +75,28 @@ MODEL_TYPE_MAP = {
 
 RESULTS_DIR = os.path.join(REPO_ROOT, "results")
 
+def fix_layoutlmv3_rel_pos_bias(model):
+    """
+    Nach quantize_dynamic werden rel_pos_bias Layer beschädigt da sie
+    direkt als Lookup-Tabelle (weight.t()[index]) statt als normaler
+    Forward-Pass verwendet werden (Zeilen 614, 638, 639 in modeling_layoutlmv3.py).
+    Diese Funktion stellt die drei betroffenen Layer als FP32 wieder her.
+    """
+    for name, module in model.named_modules():
+        for attr in ['rel_pos_bias', 'rel_2d_pos_x_bias', 'rel_2d_pos_y_bias']:
+            if hasattr(module, attr):
+                original = getattr(module, attr)
+                new_linear = torch.nn.Linear(
+                    original.in_features,
+                    original.out_features,
+                    bias=False
+                )
+                new_linear.weight = torch.nn.Parameter(
+                    original.weight().dequantize()
+                )
+                setattr(module, attr, new_linear)
+    return model
+
 
 # ── Hauptfunktion ─────────────────────────────────────────────────────────────
 def quantize_and_evaluate(dataset_name: str, model_key: str) -> dict:
@@ -118,6 +140,12 @@ def quantize_and_evaluate(dataset_name: str, model_key: str) -> dict:
         dtype=torch.qint8,
     )
     model_int8.eval()
+
+    # Fix für LayoutLMv3 rel_pos_bias Layer
+    if model_key == "layoutlmv3":
+        print("  Stelle rel_pos_bias Layer wieder her (LayoutLMv3-Fix)...")
+        model_int8 = fix_layoutlmv3_rel_pos_bias(model_int8)
+        print("  Fix angewendet.")
 
     int8_size = get_model_size_mb(model_int8)
     size_reduction = (1 - int8_size / fp32_size) * 100
