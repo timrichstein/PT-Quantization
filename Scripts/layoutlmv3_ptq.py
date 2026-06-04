@@ -151,30 +151,48 @@ def quantize_layoutlmv3(model: torch.nn.Module) -> torch.nn.Module:
 # ── Hauptfunktion ─────────────────────────────────────────────────────────────
 def run(dataset_name: str):
     """
-    Führt den kompletten PTQ-Ablauf für ein Dataset durch:
-    1. Modell laden
-    2. Quantisieren
-    3. Evaluieren
-    4. Ergebnisse speichern
-
-    Args:
-        dataset_name: Name des Datasets
+    Kompletter PTQ-Ablauf: 1. Laden  2. Quantisieren  3. Evaluieren  4. Ausgeben
     """
+    from eval.evaluate import evaluate_quantized_model
+    from utils.model_utils import get_model_size_mb
+
     print("\n" + "=" * 60)
     print(f"  LayoutLMv3 PTQ | Dataset: {dataset_name}")
     print("=" * 60)
 
-    # Schritt 1: Modell laden
+    ds_conf = DATASET_CONF[dataset_name]
+
+    # [1] Laden
     print("\n[1] Lade fine-getuntes LayoutLMv3 Teacher-Modell...")
     model = load_layoutlmv3_teacher(dataset_name)
-    print("  ✓ Modell erfolgreich geladen")
+    size_fp32 = get_model_size_mb(model)
+    print(f"  ✓ Modell geladen | FP32-Größe: {size_fp32:.1f} MB")
 
-    # Schritt 2: Quantisieren (noch nicht implementiert)
-    # print("\n[2] Quantisiere Modell...")
-    # model_quantized = quantize_layoutlmv3(model)
+    # [2] Quantisieren
+    print("\n[2] Quantisiere Modell (dynamisch INT8)...")
+    model_q = quantize_layoutlmv3(model)
+    size_int8 = get_model_size_mb(model_q)
+    print(f"  ✓ Quantisiert | INT8-Größe: {size_int8:.1f} MB "
+          f"({size_fp32 / size_int8:.2f}x kleiner)")
 
-    # Schritt 3: Evaluieren (noch nicht implementiert)
-    # Schritt 4: Ergebnisse speichern (noch nicht implementiert)
+    # [3] Evaluieren
+    print("\n[3] Evaluiere quantisiertes Modell...")
+    results = evaluate_quantized_model(
+        model=model_q,
+        dataset_name=dataset_name,
+        task=ds_conf.task,
+        model_type=DUModel.LayoutLMv3_TextAndImage,
+        split="test",
+        batch_size=16,
+    )
+
+    # [4] Ausgeben
+    print("\n[4] Ergebnisse:")
+    print(f"  Score:      {results['score']:.4f}")
+    print(f"  Latenz:     {results['avg_forward_pass_per_sample_ms']:.2f} ms/Sample")
+    print(f"  Throughput: {results['throughput_samples_s']:.1f} Samples/s")
+    print(f"  Samples:    {results['total_samples']}")
+    print(f"  FP32: {size_fp32:.1f} MB → INT8: {size_int8:.1f} MB")
 
 
 # ── Argument Parser ───────────────────────────────────────────────────────────
