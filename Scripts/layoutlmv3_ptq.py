@@ -1,23 +1,32 @@
 """
-scripts/layoutlmv3_ptq.py
+Scripts/layoutlmv3_ptq.py
 
 Post-Training Quantisierung (PTQ) für das LayoutLMv3 Teacher-Modell.
 
-Dieses Skript lädt das fine-getunte LayoutLMv3 Teacher-Modell für ein
-gegebenes Dataset, quantisiert es und evaluiert das quantisierte Modell.
+Lädt das fine-getunte LayoutLMv3 Teacher-Modell für ein Dataset, quantisiert
+es (oder lässt es als FP32-Baseline), evaluiert Score + Größe, vermisst die
+Latenz nach SlimDoc-Protokoll und schreibt die Ergebnisse nach results/.
 
-Die Quantisierung wird granular auf Layer-Ebene durchgeführt:
-  - nn.Linear Gewichte:      [WIRD NOCH DEFINIERT]
-  - nn.Linear Aktivierungen: [WIRD NOCH DEFINIERT]
-  - nn.Embedding Gewichte:   [WIRD NOCH DEFINIERT]
-  - Bias:                    bleibt float32 – zu klein für sinnvolle Ersparnis
-  - nn.LayerNorm:            bleibt float32 – sehr empfindlich auf Quantisierung
+Quantisierung (granular auf Layer-Ebene):
+  - Encoder-nn.Linear (du_model.encoder.layer.*): dynamisch INT8
+        Gewichte symmetrisch/per-channel, Aktivierungen affin/per-tensor
+  - word_embeddings:                              weight-only INT8
+  - rel_pos_*_bias, classifier, LayerNorm, Conv2d, Biases,
+    kleine Layout-/Positions-Embeddings:          bleiben FP32
 
 Aufruf:
-    python scripts/layoutlmv3_ptq.py --dataset FUNSD
-    python scripts/layoutlmv3_ptq.py --dataset SROIE
-    python scripts/layoutlmv3_ptq.py --all
+    python -u Scripts/layoutlmv3_ptq.py --dataset FUNSD
+    python -u Scripts/layoutlmv3_ptq.py --all
+    python -u Scripts/layoutlmv3_ptq.py --all --no-quantize   # FP32-Baseline
+    python -u Scripts/layoutlmv3_ptq.py --all --threads 8
 """
+
+import argparse
+import csv
+import os
+import platform
+import sys
+
 import torch
 import torch.nn as nn
 # Pfade gelten für aktuelle torch-Versionen (torch.ao.*).
@@ -29,10 +38,6 @@ from torch.ao.quantization import (
     float_qparams_weight_only_qconfig, # Embeddings: weight-only
 )
 
-import argparse
-import os
-import sys
-
 # ── Pfade einrichten ──────────────────────────────────────────────────────────
 REPO_ROOT    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SLIMDOC_PATH = "/data/stud/2026-richtstein-ba/slimdoc-main"
@@ -41,6 +46,9 @@ sys.path.insert(0, REPO_ROOT)
 
 from slimdoc import DATASET_CONF, ENV, DUModel, TASKS
 from slimdoc.model import get_model
+
+from eval.evaluate import evaluate_quantized_model, benchmark_latency
+from utils.model_utils import get_model_size_mb
 
 
 # ── Konfiguration ─────────────────────────────────────────────────────────────
@@ -56,21 +64,43 @@ TEACHER_RUN_NAMES = {
 SUPPORTED_DATASETS = list(TEACHER_RUN_NAMES.keys())
 
 
+# ── Ergebnis-Logging ──────────────────────────────────────────────────────────
+def append_row(filename: str, row: dict, base: str = None) -> str:
+    """Hängt eine Zeile an eine CSV in results/ an (Header beim ersten Mal)."""
+    base = base or os.path.join(REPO_ROOT, "results")
+    os.makedirs(base, exist_ok=True)
+    path = os.path.join(base, filename)
+    write_header = not os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if write_header:
+            w.writeheader()
+        w.writerow(row)
+    return path
+
+
+def _cpu_name() -> str:
+    """Liest den CPU-Modellnamen (für den Methodenteil der Arbeit)."""
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return platform.processor() or "unknown"
+
+
 # ── Modell laden ──────────────────────────────────────────────────────────────
 def load_layoutlmv3_teacher(dataset_name: str) -> torch.nn.Module:
     """
     Lädt das fine-getunte LayoutLMv3 Teacher-Modell für ein gegebenes Dataset.
 
-    1. get_model() baut das Modell-Skelett auf (microsoft/layoutlmv3-base
-       von HuggingFace) – Architektur steht, Gewichte sind vortrainiert.
-    2. load_state_dict() ersetzt alle Gewichte mit den fine-getunten Werten
-       aus dem lokalen Checkpoint (best.pth).
-
-    Args:
-        dataset_name: Name des Datasets (z.B. "FUNSD")
+    1. get_model() baut das Modell-Skelett auf (microsoft/layoutlmv3-base).
+    2. load_state_dict() ersetzt alle Gewichte mit den fine-getunten Werten.
 
     Returns:
-        model: Fine-getuntes LayoutLMv3-Modell im eval()-Modus auf CPU
+        Fine-getuntes LayoutLMv3-Modell im eval()-Modus auf CPU.
     """
     run_name = TEACHER_RUN_NAMES[dataset_name]
     ds_conf  = DATASET_CONF[dataset_name]
@@ -78,11 +108,9 @@ def load_layoutlmv3_teacher(dataset_name: str) -> torch.nn.Module:
 
     print(f"  Lade Checkpoint: {run_name}")
 
-    # Checkpoint laden
     chk_path   = ENV.MODELS_DIR / run_name / "best.pth"
     checkpoint = torch.load(chk_path, map_location=device)
 
-    # Schritt 1: Modell-Skelett aufbauen
     model = get_model(
         model_type=DUModel.LayoutLMv3_TextAndImage,
         task=ds_conf.task,
@@ -94,12 +122,10 @@ def load_layoutlmv3_teacher(dataset_name: str) -> torch.nn.Module:
         student_layer_map=None,
     )
 
-    # Schritt 2: Fine-getunete Gewichte laden
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
     print(f"  Modell geladen. Task: {ds_conf.task}")
-
     return model
 
 
@@ -124,7 +150,7 @@ def quantize_layoutlmv3(model: torch.nn.Module) -> torch.nn.Module:
     def _set_module(root, dotted_name, new_module):
         *parents, leaf = dotted_name.split(".")
         obj = root
-        for p in parents:           # funktioniert auch durch ModuleList-Indizes ("0", "1", ...)
+        for p in parents:           # funktioniert auch durch ModuleList-Indizes
             obj = getattr(obj, p)
         setattr(obj, leaf, new_module)
 
@@ -148,16 +174,15 @@ def quantize_layoutlmv3(model: torch.nn.Module) -> torch.nn.Module:
     return model
 
 
-# ── Hauptfunktion ─────────────────────────────────────────────────────────────
-def run(dataset_name: str):
+# ── Score + Größe (pro Dataset) ───────────────────────────────────────────────
+def run(dataset_name: str, quantize: bool = True):
     """
-    Kompletter PTQ-Ablauf: 1. Laden  2. Quantisieren  3. Evaluieren  4. Ausgeben
+    Lädt Modell, (quantisiert), evaluiert Score + Größe und schreibt
+    eine Zeile nach results/accuracy_size.csv. KEINE Latenzmessung hier
+    (die läuft genau einmal in run_latency).
     """
-    from eval.evaluate import evaluate_quantized_model
-    from utils.model_utils import get_model_size_mb
-
     print("\n" + "=" * 60)
-    print(f"  LayoutLMv3 PTQ | Dataset: {dataset_name}")
+    print(f"  LayoutLMv3 PTQ | Dataset: {dataset_name} | quantize={quantize}")
     print("=" * 60)
 
     ds_conf = DATASET_CONF[dataset_name]
@@ -168,17 +193,23 @@ def run(dataset_name: str):
     size_fp32 = get_model_size_mb(model)
     print(f"  ✓ Modell geladen | FP32-Größe: {size_fp32:.1f} MB")
 
-    # [2] Quantisieren
-    print("\n[2] Quantisiere Modell (dynamisch INT8)...")
-    model_q = quantize_layoutlmv3(model)
-    size_int8 = get_model_size_mb(model_q)
-    print(f"  ✓ Quantisiert | INT8-Größe: {size_int8:.1f} MB "
-          f"({size_fp32 / size_int8:.2f}x kleiner)")
+    # [2] (Quantisieren)
+    if quantize:
+        print("\n[2] Quantisiere Modell (dynamisch INT8)...")
+        model_eval = quantize_layoutlmv3(model)
+        precision = "int8"
+    else:
+        print("\n[2] Überspringe Quantisierung (FP32-Baseline)...")
+        model_eval = model
+        precision = "fp32"
+    size_eval = get_model_size_mb(model_eval)
+    print(f"  Größe ({precision}): {size_eval:.1f} MB "
+          f"({size_fp32 / size_eval:.2f}x ggü. FP32)")
 
-    # [3] Evaluieren
-    print("\n[3] Evaluiere quantisiertes Modell...")
+    # [3] Evaluieren (Score)
+    print("\n[3] Evaluiere Modell (Score)...")
     results = evaluate_quantized_model(
-        model=model_q,
+        model=model_eval,
         dataset_name=dataset_name,
         task=ds_conf.task,
         model_type=DUModel.LayoutLMv3_TextAndImage,
@@ -186,13 +217,54 @@ def run(dataset_name: str):
         batch_size=16,
     )
 
-    # [4] Ausgeben
+    # [4] Ausgeben + speichern
     print("\n[4] Ergebnisse:")
-    print(f"  Score:      {results['score']:.4f}")
-    print(f"  Latenz:     {results['avg_forward_pass_per_sample_ms']:.2f} ms/Sample")
-    print(f"  Throughput: {results['throughput_samples_s']:.1f} Samples/s")
-    print(f"  Samples:    {results['total_samples']}")
-    print(f"  FP32: {size_fp32:.1f} MB → INT8: {size_int8:.1f} MB")
+    print(f"  Score:   {results['score']:.4f}")
+    print(f"  Samples: {results['total_samples']}")
+    print(f"  Größe:   {size_eval:.1f} MB")
+
+    append_row("accuracy_size.csv", {
+        "model":     "layoutlmv3_teacher",
+        "precision": precision,
+        "dataset":   dataset_name,
+        "task":      str(ds_conf.task),
+        "score":     round(results["score"], 4),
+        "size_mb":   round(size_eval, 1),
+        "n_samples": results["total_samples"],
+    })
+
+
+# ── Latenz (genau einmal) ─────────────────────────────────────────────────────
+def run_latency(dataset_name: str, quantize: bool = True, num_threads: int = 8):
+    """
+    Vermisst die Latenz EINMAL (architektur-, nicht datensatzabhängig) nach
+    SlimDoc-Protokoll und schreibt eine Zeile nach results/latency.csv.
+    """
+    print("\n" + "=" * 60)
+    print(f"  Latenz-Benchmark | quantize={quantize} | threads={num_threads}")
+    print("=" * 60)
+
+    model = load_layoutlmv3_teacher(dataset_name)
+    if quantize:
+        model = quantize_layoutlmv3(model)
+        precision = "int8"
+    else:
+        precision = "fp32"
+
+    lat = benchmark_latency(
+        model, DUModel.LayoutLMv3_TextAndImage, num_threads=num_threads,
+    )
+    print(f"  {lat['batch_ms_mean']:.1f} ± {lat['batch_ms_std']:.1f} ms/Batch | "
+          f"{lat['sample_ms_mean']:.2f} ms/Sample | "
+          f"{lat['throughput_samples_s']:.1f} Samples/s | "
+          f"{lat['num_threads']} Threads")
+
+    append_row("latency.csv", {
+        "model":     "layoutlmv3_teacher",
+        "precision": precision,
+        "cpu":       _cpu_name(),
+        **lat,
+    })
 
 
 # ── Argument Parser ───────────────────────────────────────────────────────────
@@ -201,17 +273,14 @@ def parse_args():
         description="Post-Training Quantisierung für LayoutLMv3",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        choices=SUPPORTED_DATASETS,
-        help="Dataset für Quantisierung und Evaluierung.",
-    )
-    parser.add_argument(
-        "--all",
-        action="store_true",
-        help="Alle 5 Datasets nacheinander.",
-    )
+    parser.add_argument("--dataset", type=str, choices=SUPPORTED_DATASETS,
+                        help="Einzelnes Dataset.")
+    parser.add_argument("--all", action="store_true",
+                        help="Alle 5 Datasets nacheinander.")
+    parser.add_argument("--no-quantize", action="store_true",
+                        help="Quantisierung überspringen (FP32-Baseline).")
+    parser.add_argument("--threads", type=int, default=8,
+                        help="Feste CPU-Threadzahl für den Latenz-Benchmark.")
     return parser.parse_args()
 
 
@@ -224,6 +293,11 @@ if __name__ == "__main__":
         sys.exit(1)
 
     datasets = SUPPORTED_DATASETS if args.all else [args.dataset]
+    quantize = not args.no_quantize
 
+    # Score + Größe pro Dataset
     for dataset in datasets:
-        run(dataset)
+        run(dataset, quantize=quantize)
+
+    # Latenz genau einmal (Architektur für alle Datasets identisch)
+    run_latency(datasets[0], quantize=quantize, num_threads=args.threads)

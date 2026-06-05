@@ -1,4 +1,3 @@
-# benchmark.py  –  Vollständiges Benchmark-Skript mit W&B
 """
 eval/evaluate.py
 
@@ -205,4 +204,80 @@ def evaluate_quantized_model(
         "avg_forward_pass_per_sample_ms":  avg_sample_ms,
         "throughput_samples_s":            throughput,
         "total_samples":                   total_samples,
+    }
+
+
+def benchmark_latency(
+    model: torch.nn.Module,
+    model_type: DUModel,
+    batch_size: int = 16,
+    seq_len: int = 512,
+    n_warmup: int = 10,
+    n_measure: int = 100,
+    n_repeats: int = 10,
+    num_threads: int = 8,
+) -> dict:
+    """
+    Latenz-Benchmark nach SlimDoc-Protokoll (Abschnitt 4.4.6), auf CPU,
+    mit synthetischen Inputs fester Form. Misst NUR den Forward-Pass.
+
+    Warum synthetisch: Die Forward-Pass-Zeit hängt nur von Architektur,
+    Präzision, Sequenzlänge, Batch-Größe und Hardware ab – nicht vom Inhalt.
+    Synthetische 512-Token-Inputs sind daher zeitlich äquivalent zu echten
+    DocVQA-Samples und vollständig reproduzierbar.
+
+    Args:
+        model:       Zu vermessendes Modell (FP32 oder INT8)
+        model_type:  DUModel-Enum
+        batch_size:  16 (wie SlimDoc)
+        seq_len:     512 (max. Sequenzlänge, wie SlimDoc)
+        n_warmup:    10 Warmup-Batches (wie SlimDoc)
+        n_measure:   100 Batches pro Wiederholung (wie SlimDoc)
+        n_repeats:   10 Wiederholungen (wie SlimDoc)
+        num_threads: Feste, zu berichtende CPU-Threadzahl
+
+    Returns:
+        dict mit batch_ms_mean/std, sample_ms_mean, throughput_samples_s,
+        num_threads, batch_size, seq_len
+    """
+    torch.backends.quantized.engine = "fbgemm"
+    torch.set_num_threads(num_threads)
+    device = torch.device("cpu")
+    model = model.to(device).eval()
+
+    VOCAB = 50265
+    input_ids      = torch.randint(0, VOCAB, (batch_size, seq_len), device=device)
+    bbox           = torch.randint(0, 1000, (batch_size, seq_len, 4), device=device)
+    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long, device=device)
+    pixel_values   = (
+        torch.rand(batch_size, 3, 224, 224, device=device)
+        if model_type == DUModel.LayoutLMv3_TextAndImage else None
+    )
+
+    def _fwd():
+        return forward(
+            model=model, model_type=model_type, output_internals=False,
+            input_ids=input_ids, bbox=bbox,
+            attention_mask=attention_mask, pixel_values=pixel_values,
+        )
+
+    with torch.no_grad():
+        for _ in range(n_warmup):
+            _fwd()
+        per_repeat_ms = []
+        for _ in range(n_repeats):
+            t0 = time.perf_counter()
+            for _ in range(n_measure):
+                _fwd()
+            per_repeat_ms.append((time.perf_counter() - t0) * 1000.0 / n_measure)
+
+    arr = np.array(per_repeat_ms)
+    return {
+        "batch_ms_mean":        float(arr.mean()),
+        "batch_ms_std":         float(arr.std()),
+        "sample_ms_mean":       float(arr.mean() / batch_size),
+        "throughput_samples_s": float(batch_size / (arr.mean() / 1000.0)),
+        "num_threads":          torch.get_num_threads(),
+        "batch_size":           batch_size,
+        "seq_len":              seq_len,
     }
