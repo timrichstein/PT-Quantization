@@ -30,6 +30,7 @@ import os
 import platform
 import sys
 
+import pandas as pd
 import torch
 import torch.nn as nn
 # Pfade gelten für aktuelle torch-Versionen (torch.ao.*).
@@ -83,17 +84,34 @@ MODEL_LABELS = {
 
 
 # ── Ergebnis-Logging ──────────────────────────────────────────────────────────
-def append_row(filename: str, row: dict, base: str = None) -> str:
-    """Hängt eine Zeile an eine CSV in results/ an (Header beim ersten Mal)."""
+def upsert_row(filename: str, row: dict, key_cols: list, base: str = None) -> str:
+    """
+    Schreibt eine Zeile nach results/<filename> und ersetzt eine eventuell
+    vorhandene Zeile mit gleichem Schlüssel (key_cols). Wiederholte Läufe sind
+    dadurch gefahrlos – kein Duplikat, kein manuelles Aufräumen.
+    """
     base = base or os.path.join(REPO_ROOT, "results")
     os.makedirs(base, exist_ok=True)
     path = os.path.join(base, filename)
-    write_header = not os.path.exists(path)
-    with open(path, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(row.keys()))
-        if write_header:
-            w.writeheader()
-        w.writerow(row)
+    new = pd.DataFrame([row])
+
+    if os.path.exists(path):
+        df = pd.read_csv(path)
+        for col in new.columns:
+            if col not in df.columns:
+                df[col] = pd.NA
+        for col in df.columns:
+            if col not in new.columns:
+                new[col] = pd.NA
+        new = new[df.columns]
+        key_series = pd.Series({k: row[k] for k in key_cols})
+        mask = (df[key_cols].astype(str) == key_series.astype(str)).all(axis=1)
+        df = df[~mask]
+        df = pd.concat([df, new], ignore_index=True)
+    else:
+        df = new
+
+    df.to_csv(path, index=False)
     return path
 
 
@@ -303,7 +321,7 @@ def run(dataset_name: str, model_kind: str = "teacher", quantize: bool = True):
     print(f"  Samples: {results['total_samples']}")
     print(f"  Größe:   {size_eval:.1f} MB")
 
-    append_row("accuracy_size.csv", {
+    upsert_row("accuracy_size.csv", {
         "model":     model_label,
         "precision": precision,
         "dataset":   dataset_name,
@@ -311,7 +329,7 @@ def run(dataset_name: str, model_kind: str = "teacher", quantize: bool = True):
         "score":     round(results["score"], 4),
         "size_mb":   round(size_eval, 1),
         "n_samples": results["total_samples"],
-    })
+    }, key_cols=["model", "precision", "dataset"])
 
 
 # ── Latenz (genau einmal) ─────────────────────────────────────────────────────
@@ -342,12 +360,12 @@ def run_latency(dataset_name: str, model_kind: str = "teacher",
           f"{lat['throughput_samples_s']:.1f} Samples/s | "
           f"{lat['num_threads']} Threads")
 
-    append_row("latency.csv", {
+    upsert_row("latency.csv", {
         "model":     model_label,
         "precision": precision,
         "cpu":       _cpu_name(),
         **lat,
-    })
+    }, key_cols=["model", "precision"])
 
 
 # ── Argument Parser ───────────────────────────────────────────────────────────
