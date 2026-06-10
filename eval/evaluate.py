@@ -247,7 +247,19 @@ def benchmark_latency(
 
     VOCAB = 50265
     input_ids      = torch.randint(0, VOCAB, (batch_size, seq_len), device=device)
-    bbox           = torch.randint(0, 1000, (batch_size, seq_len, 4), device=device)
+
+    # bbox-Format: [x_min, y_min, x_max, y_max], normalisiert auf [0, 1000].
+    # Wohlgeformt erzeugen, damit (x_max - x_min) und (y_max - y_min) >= 0 sind
+    # (LiLT leitet daraus Breite/Höhe ab und indiziert damit Embedding-Tabellen).
+    x = torch.randint(0, 1000, (batch_size, seq_len, 2))
+    x_sorted, _ = x.sort(dim=-1)                 # spaltenweise x_min <= x_max
+    y = torch.randint(0, 1000, (batch_size, seq_len, 2))
+    y_sorted, _ = y.sort(dim=-1)                 # y_min <= y_max
+    bbox = torch.stack(
+        [x_sorted[..., 0], y_sorted[..., 0], x_sorted[..., 1], y_sorted[..., 1]],
+        dim=-1,
+    )
+    
     attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long, device=device)
     pixel_values   = (
         torch.rand(batch_size, 3, 224, 224, device=device)
