@@ -1,0 +1,3 @@
+kind,scheme,dtype,scale_pytorch,scale_manual,zero_point_pytorch,zero_point_manual,mismatches,n_values
+weight,symmetric_per_channel,qint8,1.15544221e-03,1.15544223e-03,0,0,0,768
+activation,affine_per_tensor,quint8,4.87650067e-02,4.87650067e-02,132,132,1,8712192
